@@ -21,7 +21,9 @@ import (
 	"github.com/zegl/kube-score/renderer/junit"
 	"github.com/zegl/kube-score/renderer/sarif"
 	"github.com/zegl/kube-score/score"
+	"github.com/zegl/kube-score/score/baseline"
 	"github.com/zegl/kube-score/score/checks"
+	"github.com/zegl/kube-score/score/opa"
 	"github.com/zegl/kube-score/scorecard"
 	"golang.org/x/term"
 )
@@ -116,6 +118,15 @@ func scoreFiles(binName string, args []string) error {
 	kubernetesVersion := fs.String("kubernetes-version", "v1.18", "Setting the kubernetes-version will affect the checks ran against the manifests. Set this to the version of Kubernetes that you're using in production for the best results.")
 	minReplicasDeployment := fs.Int("min-replicas-deployment", 2, "Minimum required number of replicas for a deployment")
 	minReplicasHPA := fs.Int("min-replicas-hpa", 2, "Minimum required number of replicas for a horizontal pod autoscaler")
+
+	// Baseline flags
+	saveBaselineFile := fs.String("save-baseline", "", "After scoring, write all non-OK findings to this JSON file for use as a future baseline")
+	baselineFile := fs.String("baseline", "", "Suppress findings that match entries in this baseline JSON file")
+	baselineStrict := fs.Bool("baseline-strict", false, "When --baseline is set, exit with error if the baseline references resources absent from the input")
+
+	// OPA/Rego passthrough flag
+	regoPolicyDir := fs.String("rego-policy", "", "Directory containing .rego policy files to evaluate against each Kubernetes object")
+
 	setDefault(fs, binName, "score", false)
 
 	err := fs.Parse(args)
@@ -217,11 +228,40 @@ Use "-" as filename to read from STDIN.`, execName(binName))
 		return fmt.Errorf("failed to parse files: %w", err)
 	}
 
-	checks := score.RegisterAllChecks(parsedFiles, &checks.Config{IgnoredTests: ignoredTests}, runConfig)
+	allChecks := score.RegisterAllChecks(parsedFiles, &checks.Config{IgnoredTests: ignoredTests}, runConfig)
 
-	scoreCard, err := score.Score(parsedFiles, checks, runConfig)
+	scoreCard, err := score.Score(parsedFiles, allChecks, runConfig)
 	if err != nil {
 		return err
+	}
+
+	// Apply OPA/Rego policies if a directory was specified.
+	if *regoPolicyDir != "" {
+		if err := opa.LoadAndApply(*scoreCard, parsedFiles, *regoPolicyDir, runConfig); err != nil {
+			return fmt.Errorf("rego policy evaluation failed: %w", err)
+		}
+	}
+
+	// Save baseline before any suppression so the file reflects raw findings.
+	if *saveBaselineFile != "" {
+		if err := baseline.Save(*saveBaselineFile, scoreCard); err != nil {
+			return fmt.Errorf("failed to write baseline: %w", err)
+		}
+	}
+
+	// Apply baseline suppression.
+	if *baselineFile != "" {
+		b, err := baseline.Load(*baselineFile)
+		if err != nil {
+			return fmt.Errorf("failed to load baseline: %w", err)
+		}
+		if *baselineStrict {
+			if err := baseline.CheckStrict(scoreCard, b, *baselineFile); err != nil {
+				return err
+			}
+		}
+		count := baseline.Suppress(scoreCard, b)
+		fmt.Fprintf(os.Stderr, "%d findings suppressed by baseline (%s)\n", count, *baselineFile)
 	}
 
 	var exitCode int
