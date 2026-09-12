@@ -11,6 +11,7 @@ func Register(allChecks *checks.Checks) {
 	allChecks.RegisterPodCheck("Container Security Context User Group ID", `Makes sure that all pods have a security context with valid UID and GID set `, containerSecurityContextUserGroupID)
 	allChecks.RegisterPodCheck("Container Security Context Privileged", "Makes sure that all pods have a unprivileged security context set", containerSecurityContextPrivileged)
 	allChecks.RegisterPodCheck("Container Security Context ReadOnlyRootFilesystem", "Makes sure that all pods have a security context with read only filesystem set", containerSecurityContextReadOnlyRootFilesystem)
+	allChecks.RegisterPodCheck("Container Seccomp Profile Enforcement", "Makes sure that all pods have a Seccomp profile set and that no container overrides it with Unconfined", containerSeccompProfileEnforced)
 
 	allChecks.RegisterOptionalPodCheck("Container Seccomp Profile", `Makes sure that all pods have at a seccomp policy configured.`, podSeccompProfile)
 }
@@ -102,6 +103,43 @@ func containerSecurityContextUserGroupID(ps ks.PodSpecer) (score scorecard.TestS
 		}
 	}
 	if noContextSet || hasLowUserID || hasLowGroupID {
+		score.Grade = scorecard.GradeCritical
+	} else {
+		score.Grade = scorecard.GradeAllOK
+	}
+	return
+}
+
+// containerSeccompProfileEnforced checks that a Seccomp profile is configured at the pod level
+// and that no container-level override sets it to Unconfined.
+// Check A: pod-level seccompProfile must be present and not Unconfined.
+// Check B: any container-level seccompProfile override that is Unconfined is critical.
+func containerSeccompProfileEnforced(ps ks.PodSpecer) (score scorecard.TestScore, err error) {
+	podSpec := ps.GetPodTemplateSpec().Spec
+	hasCritical := false
+
+	// Check A: pod-level securityContext.seccompProfile
+	podSec := podSpec.SecurityContext
+	if podSec == nil || podSec.SeccompProfile == nil {
+		hasCritical = true
+		score.AddComment("", "Container does not set a Seccomp profile. Set securityContext.seccompProfile.type to RuntimeDefault.", "Set securityContext.seccompProfile.type to RuntimeDefault or Localhost.")
+	} else if podSec.SeccompProfile.Type == corev1.SeccompProfileTypeUnconfined {
+		hasCritical = true
+		score.AddComment("", "Container does not set a Seccomp profile. Set securityContext.seccompProfile.type to RuntimeDefault.", "The Unconfined profile disables all seccomp filtering. Set securityContext.seccompProfile.type to RuntimeDefault or Localhost.")
+	}
+
+	// Check B: container-level seccompProfile overrides must not be Unconfined
+	allContainers := append(podSpec.InitContainers, podSpec.Containers...)
+	for _, c := range allContainers {
+		if c.SecurityContext != nil &&
+			c.SecurityContext.SeccompProfile != nil &&
+			c.SecurityContext.SeccompProfile.Type == corev1.SeccompProfileTypeUnconfined {
+			hasCritical = true
+			score.AddComment(c.Name, "Container does not set a Seccomp profile. Set securityContext.seccompProfile.type to RuntimeDefault.", "The Unconfined profile disables all seccomp filtering. Set securityContext.seccompProfile.type to RuntimeDefault or Localhost.")
+		}
+	}
+
+	if hasCritical {
 		score.Grade = scorecard.GradeCritical
 	} else {
 		score.Grade = scorecard.GradeAllOK
